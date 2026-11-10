@@ -1,0 +1,144 @@
+
+一、架构
+base-client：ask   prase
+tool-execute：register-tool  call-tool tool-message
+agent:
+ base-client(不采用继承而是组合，核心是ask和promote，promote来知道sys身份即不同agent)
+ tool-execute(通过回答来调用工具，并且需要提供可选工具给llm，并根据需要调用tool)
+ converssation-history(历史记录，每次都追加新信息)->memory
+
+session:
+tokens
+history
+compact：
+context-build
+
+
+1.1、记忆模块
+
+ 后面暂时定为根据 converssation-history来提取记忆（工作，情景，语义，感知）
+
+ 暂时只考虑情景和语义记忆
+
+ 暂定设置token限制，滑动窗口，用户要求三种方式触发
+
+1.2或许可以结合，达到token限制后根据message，将窗口内部分append为记忆，暂定通过直接喂给llm
+让他来提取进而持久化，来模拟窗口
+
+1.2、session
+Chat Completions API,会话对于llm是不存在的，它只是单纯根据上下文进行推理，session是在agent中
+
+API 类型	会话状态管理
+Chat Completions	通常由调用方传入完整消息历史
+Responses API	支持通过 previous_response_id 延续响应上下文
+Conversations API	支持服务端管理持久化对话状态
+
+1.3上下文窗口，compress
+   
+   当history超过comoress要进行压缩，因此要将摘要也追加到history，考虑重启后如何恢复上下文。
+   
+   history的变化
+   由于要将记录量化做到区分不同记录，增加seq和turn，每一次完整的对话称为turn
+   1、可以将摘要单独保存，每次都读取文件然后，然后就可以获取摘要之后哪些seq并未comress，再进行随机读取
+   2、则是将compress也作为history记录，然后顺序读取整个history，每到comress就替换相应的seq
+   但是1存储多个不同文件持久化一致的问题，维护困难，暂时采用2
+
+   compress：
+
+    comress在history中同样采用追加，但在message中采用replace，将压缩的seq进行替换，
+   compress时为了保证tool call和tool resultt联系应该要一起compress
+
+
+二、响应解析和报文
+ llm返回后追加记录和工作记忆再解析，一次对话存储，user-question，llm-response，tool-message，answer
+ llm的返回主流是Chat Completions 风格，这里的id和tool-call-id都是llm生成对于不同的tool
+ 因为一次可能调用几个相同的tool
+ {
+    "id": "chatcmpl-123",
+    "object": "chat.completion",
+    "choices": [
+        {
+            "index": 0,
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {
+                        "id": "call_001",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"北京\"}"
+                        }
+                    }
+                ]
+            }
+        }
+    ]
+}
+
+tool-call和message设计为：
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class Message:（前三个与llm返回的一致，id区分不同session    metadata记录时间戳等，）
+    role: str
+    content: Any = None
+
+    tool_calls: list[ToolCall] = field(
+        default_factory=list
+    )
+    
+    tool_call_id: str | None = None
+
+    metadata: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+
+创建compaction-basic目录，新增compact类，当上下文触发限制T时对上下文进行压缩，
+T的设置如图片所示，安全预留和输出预留采取模型最大输出token，其他具体数值先不填写，
+；当message的token>=T，则从末尾开始计算token并和K比较，k的值用第二张图计算，
+当超过K后，通过enentDelta（event）判断当前是否可以作为分界点，将这以前的seq进行压缩，
+seq0不参与；
+
+
+token估算：
+采用UTF8，4字节估算，
+T=min（WR，W-o-b）取下
+k=（w-o）r取下
+W：当前模型的 Context Window。
+r：压缩触发比例，沿用 DSH 的策略。
+O：输出预留，设置为当前模型支持的最大输出 Token。
+B：安全预留，同样设置为当前模型支持的最大输出 Token。
+
+compact：
+采用正向扫描构建缓存+反向定位
+正向：
+构建缓存：interface BalanceCache {
+    generation: number;缓存是否有效
+
+    cutBalanced: readonly boolean[];n个surface有n+1个node
+
+    indexBySeq: Map<SessionSeq, number>;反向定位通过seq获取在surface的位置从而判断是否安全
+
+    inProgressToolCalls: number;tool-result不一定全部返回，此时将pendig记住配合eventDelta()增量更新位置
+}
+
+反向：
+通过不断估计token，达到限制k之后，通过seq得到node的位置，再由cutBalanced判断是否安全
+这里构建2个函数，判断node前后是否安全，也就是分别查看【node】和【node+1】就可以是实现前后的概念
+
+摘要：
+压缩后的摘要也追加到history，参与seq计算，并且要附带说明这是哪些seq压缩而成；
+在message中采用replace，将摘要和被压缩的seq替换，保证信息顺序不变；重启时，
+message通过读取文件组织seq而来，当遇到压缩的seq，也效仿之前的进行替换，也就是顺序读取，
+并不断替换，最终得到完整的mwssage；最后在tool中注册压缩工具，当用户要求压缩时，
+llm通过tool-call进行
+

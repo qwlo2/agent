@@ -1,0 +1,8 @@
+.env
+.env.example
+.venv/
+__pycache__/
+*.py[cod]
+data/history.json
+data/history.jsonl
+data/history.jsonl.*.bak
